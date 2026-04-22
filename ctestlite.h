@@ -3,45 +3,56 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+#if defined(_MSC_VER)
+__pragma(warning(disable : 5045)) /**/
+__pragma(warning(disable : 5247)) /**/
+__pragma(warning(disable : 5248)) /**/
+
+#pragma section(".CRT$XCU", read)
+#define CTESTLITE_REGISTER     __declspec(allocate(".CRT$XCU"))
+#define CTESTLITE_REFERENCE(x) __pragma(comment(linker, "/include:" CTESTLITE_TOSTR(x)))
+
+#else
+#error "Compiler not not supported!"
+#endif
+
 #define CTESTLITE_CODE_SUCCESS 0
 #define CTESTLITE_CODE_FAILURE 1
 
+#define CTESTLITE_TOSTR_IMPL(x)  #x
+#define CTESTLITE_TOSTR(x)       CTESTLITE_TOSTR_IMPL(x)
 #define CTESTLITE_CAT_IMPL(a, b) a##b
 #define CTESTLITE_CAT(a, b)      CTESTLITE_CAT_IMPL(a, b)
-#define CTESTLITE_ANON(x)        CTESTLITE_CAT(x, __COUNTER__)
+#define CTESTLITE_ANON(x)        CTESTLITE_CAT(x, __LINE__)
 
 #define CTESTLITE_TEST_CASE(f, name)                                           \
   static void f(ctestlite_context *);                                          \
-  static int CTESTLITE_ANON(CTESTLITE_ANON_VAR_) =                             \
-      ctestlite_contexts_add({f, name});                                       \
+  static void CTESTLITE_CAT(f, _REG)(void) {                                   \
+    ctestlite_context ctx = {0};                                               \
+    ctx.test_function     = (f);                                               \
+    ctx.test_name         = (name);                                            \
+    ctestlite_contexts_add(ctx);                                               \
+  }                                                                            \
+  extern "C" {                                                                 \
+  CTESTLITE_REGISTER                                                           \
+  CTESTLITE_REFERENCE(CTESTLITE_CAT(f, _PTR))                                  \
+  void (*CTESTLITE_CAT(f, _PTR))(void) = CTESTLITE_CAT(f, _REG);               \
+  }                                                                            \
   static void f(ctestlite_context *ctx)
 #define TEST_CASE(name)                                                        \
-  CTESTLITE_TEST_CASE(CTESTLITE_ANON(CTESTLITE_ANON_FUNC_), name)
+  CTESTLITE_TEST_CASE(CTESTLITE_ANON(CTESTLITE_TEST_), name)
 
-#define CTESTLITE_TEST_TRUE(expr, expr_str, line)                              \
-  if ((expr) == 0) {                                                           \
-    ctx->test_expr        = expr_str;                                          \
+#define CTESTLITE_TEST(expr, str, line)                                        \
+  if (!(expr)) {                                                               \
+    ctx->test_expr        = (str);                                             \
     ctx->test_result_code = CTESTLITE_CODE_FAILURE;                            \
-    ctx->test_result_line = line;                                              \
+    ctx->test_result_line = (line);                                            \
     return;                                                                    \
   }
-#define CTESTLITE_TEST_FALSE(expr, expr_str, line)                             \
-  if ((expr) != 0) {                                                           \
-    ctx->test_expr        = expr_str;                                          \
-    ctx->test_result_code = CTESTLITE_CODE_FAILURE;                            \
-    ctx->test_result_line = line;                                              \
-    return;                                                                    \
-  }
-
-#define TEST_TRUE(expr)  CTESTLITE_TEST_TRUE((expr), #expr, __LINE__)
-#define TEST_FALSE(expr) CTESTLITE_TEST_FALSE((expr), #expr, __LINE__)
-
-#define TEST_EQ(a, b) TEST_TRUE(a == b)
-#define TEST_NE(a, b) TEST_TRUE(a != b)
-#define TEST_LE(a, b) TEST_TRUE(a <= b)
-#define TEST_QE(a, b) TEST_TRUE(a >= b)
-#define TEST_LT(a, b) TEST_TRUE(a < b)
-#define TEST_QT(a, b) TEST_TRUE(a > b)
+#define TEST(expr)                                                             \
+  do {                                                                         \
+    CTESTLITE_TEST(expr, CTESTLITE_TOSTR(expr), __LINE__)                      \
+  } while (0);
 
 typedef struct ctestlite_context {
   void      (*test_function)(ctestlite_context *);
@@ -51,7 +62,7 @@ typedef struct ctestlite_context {
   int         test_result_line;
 } ctestlite_context;
 
-struct {
+static struct {
   ctestlite_context *contexts;
   ctestlite_context *capacity;
   ctestlite_context *last;
@@ -60,75 +71,52 @@ struct {
 static unsigned int ctestlite_contexts_size() {
   return (unsigned int)(ctestlite_contexts.last - ctestlite_contexts.contexts);
 }
-static ctestlite_context *ctestlite_contexts_get(unsigned int n) {
-  return &ctestlite_contexts.contexts[n];
-}
-static unsigned int ctestlite_contexts_add(ctestlite_context ctx) {
+static void ctestlite_contexts_add(ctestlite_context ctx) {
   if (ctestlite_contexts.last >= ctestlite_contexts.capacity) {
     const unsigned int old_size = ctestlite_contexts_size();
     const unsigned int new_size = old_size ? old_size * 2 : 16;
 
     ctestlite_context *new_array = (ctestlite_context *)realloc(
         ctestlite_contexts.contexts, new_size * sizeof(ctestlite_context));
+    if (new_array == NULL) {
+      printf("[ ERROR ] Failed to register test \'%s\'\n", ctx.test_name);
+      return;
+    }
+
     ctestlite_contexts.contexts = new_array;
     ctestlite_contexts.capacity = new_array + new_size;
-    ctestlite_contexts.last = new_array + old_size;
+    ctestlite_contexts.last     = new_array + old_size;
   }
   *(ctestlite_contexts.last++) = ctx;
-  return 0;
+  return;
 }
-
-#if defined(_WIN32)
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>
-
-typedef LARGE_INTEGER ctestlite_time;
-static ctestlite_time ctestlite_timestamp() {
-  LARGE_INTEGER value;
-  QueryPerformanceCounter(&value);
-  return value;
-}
-static double ctestlite_timesince(ctestlite_time stamp) {
-  LARGE_INTEGER freq, time;
-  QueryPerformanceFrequency(&freq);
-  QueryPerformanceCounter(&time);
-
-  return (double)(time.QuadPart - stamp.QuadPart) / (double)freq.QuadPart;
-}
-#endif
-
-
 
 int main() {
-  int counter_success = 0;
   int counter_failure = 0;
 
   const unsigned int test_count = ctestlite_contexts_size();
   for (unsigned int i = 0; i < test_count; ++i) {
-    ctestlite_context *const ctx = ctestlite_contexts_get(i);
+    ctestlite_context *const ctx = &ctestlite_contexts.contexts[i];
 
-    const ctestlite_time perf_start = ctestlite_timestamp();
     ctx->test_result_code = 0;
     ctx->test_result_line = 0;
     ctx->test_function(ctx);
-    const double perf_time = ctestlite_timesince(perf_start);
 
     switch (ctx->test_result_code) {
     case CTESTLITE_CODE_SUCCESS:
-      counter_success += 1;
-      printf("[SUCCESS] Test: %s (%06.3fms)\n", ctx->test_name,
-             1000.0 * perf_time);
+      printf("[SUCCESS] Test: %s\n", ctx->test_name);
       break;
     case CTESTLITE_CODE_FAILURE:
       counter_failure += 1;
-      printf("[FAILURE] Test: %s (%06.3fms)\n", ctx->test_name,
-             1000.0 * perf_time);
+      printf("[FAILURE] Test: %s\n", ctx->test_name);
       printf("\tassertion \'%s\' failed on line %d\n", ctx->test_expr,
              ctx->test_result_line);
       break;
     }
   }
-  return counter_failure;
+
+  free(ctestlite_contexts.contexts);
+  return counter_failure ? EXIT_FAILURE : EXIT_SUCCESS;
 }
 
 #endif
